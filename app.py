@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -11,6 +10,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+import verification_store
+from verification_rules import evaluate_field_evidence, haversine_km, parse_instant
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "catastrophe_claims.db"
@@ -45,14 +47,6 @@ def actor_id(actor: str) -> str:
     if not actor:
         raise DomainError("缺少操作人")
     return actor
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * 6371.0088 * math.asin(math.sqrt(a))
 
 
 def coordinate(value: Any, label: str, low: float, high: float) -> float:
@@ -149,6 +143,7 @@ class CatastropheClaimService:
                 CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(sha256);
                 """
             )
+            verification_store.init_schema(conn)
 
     def _audit(self, conn: sqlite3.Connection, claim_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -161,6 +156,42 @@ class CatastropheClaimService:
         if not row:
             raise DomainError("理赔案件不存在", 404)
         return row
+
+    def _validate_zone(self, center_lat: Any, center_lon: Any, disaster_time: Any,
+                       radius_km: Any) -> tuple[float, float, str, float]:
+        lat = coordinate(center_lat, "灾区中心纬度", -90, 90)
+        lon = coordinate(center_lon, "灾区中心经度", -180, 180)
+        try:
+            moment = parse_instant(disaster_time, "灾情时刻").isoformat(timespec="seconds")
+        except ValueError as exc:
+            raise DomainError(str(exc)) from exc
+        try:
+            radius = float(radius_km)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("灾区半径必须是数值") from exc
+        if not 0 < radius <= 2000:
+            raise DomainError("灾区半径应在 0 到 2000 公里之间")
+        return lat, lon, moment, radius
+
+    def _register_zone(self, conn: sqlite3.Connection, actor: str, claim_id: int,
+                       zone: tuple[float, float, str, float]) -> None:
+        lat, lon, moment, radius = zone
+        verification_store.upsert_zone(conn, claim_id, lat, lon, moment, radius, actor, utcnow())
+        self._audit(conn, claim_id, actor, "disaster_zone.registered",
+                    {"center_lat": lat, "center_lon": lon, "disaster_time": moment, "radius_km": radius})
+
+    def register_disaster_zone(self, actor: str, role: str, claim_id: int, center_lat: Any,
+                               center_lon: Any, disaster_time: Any, radius_km: Any) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "登记灾区")
+        zone = self._validate_zone(center_lat, center_lon, disaster_time, radius_km)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = self._claim(conn, claim_id)
+            if claim["status"] in TERMINAL:
+                raise DomainError("已结束案件不能登记灾区", 409)
+            self._register_zone(conn, actor, claim_id, zone)
+            return dict(verification_store.get_zone(conn, claim_id))
 
     def create_claim(self, actor: str, role: str, claim_no: str, event_id: str,
                      region: str, peril_type: str, policy_no: str, claimant_ref: str,
@@ -212,7 +243,9 @@ class CatastropheClaimService:
             return dict(self._claim(conn, cur.lastrowid))
 
     def triage_claim(self, actor: str, role: str, claim_id: int, expected_version: int,
-                     fraud_score: float = 0.0, remote_review: bool = False) -> dict[str, Any]:
+                     fraud_score: float = 0.0, remote_review: bool = False,
+                     disaster_lat: Any = None, disaster_lon: Any = None,
+                     disaster_time: Any = None, radius_km: Any = None) -> dict[str, Any]:
         actor = actor_id(actor)
         require_role(role, {"supervisor"}, "案件分级")
         try:
@@ -221,6 +254,12 @@ class CatastropheClaimService:
             raise DomainError("欺诈评分必须是数值") from exc
         if not 0 <= fraud_score <= 1:
             raise DomainError("欺诈评分应在 0 到 1 之间")
+        zone = None
+        zone_inputs = [disaster_lat, disaster_lon, disaster_time, radius_km]
+        if any(v is not None for v in zone_inputs):
+            if not all(v is not None for v in zone_inputs):
+                raise DomainError("登记灾区须同时提供中心经纬度、灾情时刻和半径")
+            zone = self._validate_zone(disaster_lat, disaster_lon, disaster_time, radius_km)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             claim = self._claim(conn, claim_id)
@@ -235,6 +274,8 @@ class CatastropheClaimService:
                 (fraud_score, priority, int(bool(remote_review)), new_status, utcnow(), claim_id),
             )
             self._audit(conn, claim_id, actor, "claim.triaged", {"priority": priority, "status": new_status})
+            if zone:
+                self._register_zone(conn, actor, claim_id, zone)
             return dict(self._claim(conn, claim_id))
 
     def assign_claim(self, actor: str, role: str, claim_id: int, assignee: str,
@@ -260,7 +301,8 @@ class CatastropheClaimService:
             return dict(self._claim(conn, claim_id))
 
     def add_evidence(self, actor: str, role: str, claim_id: int, sha256: str,
-                     filename: str, source: str) -> dict[str, Any]:
+                     filename: str, source: str, latitude: Any = None, longitude: Any = None,
+                     captured_at: Any = None, device_id: Any = None) -> dict[str, Any]:
         actor = actor_id(actor)
         require_role(role, {"intake", "adjuster", "surveyor", "supervisor"}, "添加损失证据")
         sha256 = sha256.strip().lower()
@@ -268,6 +310,19 @@ class CatastropheClaimService:
             raise DomainError("证据哈希必须是 64 位 SHA-256 十六进制")
         if not filename.strip() or not source.strip():
             raise DomainError("证据文件名和来源不能为空")
+        geo_inputs = [latitude, longitude, captured_at, device_id]
+        is_field = any(v is not None and str(v).strip() != "" for v in geo_inputs)
+        lat = lon = captured_iso = device = None
+        if is_field:
+            if not all(v is not None and str(v).strip() != "" for v in geo_inputs):
+                raise DomainError("现场证据必须同时补录经纬度、拍摄时间和设备号")
+            lat = coordinate(latitude, "拍摄纬度", -90, 90)
+            lon = coordinate(longitude, "拍摄经度", -180, 180)
+            try:
+                captured_iso = parse_instant(captured_at, "拍摄时间").isoformat(timespec="seconds")
+            except ValueError as exc:
+                raise DomainError(str(exc)) from exc
+            device = str(device_id).strip()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             claim = self._claim(conn, claim_id)
@@ -276,9 +331,23 @@ class CatastropheClaimService:
             existing = conn.execute("SELECT * FROM evidence WHERE claim_id=? AND sha256=?", (claim_id, sha256)).fetchone()
             if existing:
                 return dict(existing)
+            flags: list[dict[str, str]] = []
+            if is_field:
+                zone_row = verification_store.get_zone(conn, claim_id)
+                zone = dict(zone_row) if zone_row else None
+                sightings = [dict(r) for r in verification_store.device_sightings(conn, device)]
+                try:
+                    flags = evaluate_field_evidence(zone, captured_iso, lat, lon, device, sightings)
+                except ValueError as exc:
+                    raise DomainError(str(exc)) from exc
+            status = "received"
+            if is_field:
+                status = "pending" if flags else "verified"
             cur = conn.execute(
-                "INSERT INTO evidence(claim_id,sha256,filename,source,submitter,created_at) VALUES(?,?,?,?,?,?)",
-                (claim_id, sha256, filename.strip(), source.strip(), actor, utcnow()),
+                """INSERT INTO evidence(claim_id,sha256,filename,source,submitter,status,latitude,longitude,
+                   captured_at,device_id,verify_flags,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (claim_id, sha256, filename.strip(), source.strip(), actor, status, lat, lon,
+                 captured_iso, device, json.dumps(flags, ensure_ascii=False), utcnow()),
             )
             hash_claims = [r["claim_id"] for r in conn.execute(
                 "SELECT DISTINCT claim_id FROM evidence WHERE sha256=?", (sha256,)
@@ -291,8 +360,50 @@ class CatastropheClaimService:
                         (utcnow(), cid),
                     )
                 self._audit(conn, claim_id, actor, "evidence.bulk_reuse_detected", {"sha256": sha256, "claim_ids": hash_claims})
-            self._audit(conn, claim_id, actor, "evidence.added", {"evidence_id": cur.lastrowid, "suspicious": suspicious})
-            return {"evidence": dict(conn.execute("SELECT * FROM evidence WHERE id=?", (cur.lastrowid,)).fetchone()), "bulk_reuse": suspicious, "affected_claims": hash_claims}
+            self._audit(conn, claim_id, actor, "evidence.added",
+                        {"evidence_id": cur.lastrowid, "suspicious": suspicious, "field": is_field, "verify_status": status})
+            if flags:
+                self._audit(conn, claim_id, actor, "evidence.verification_pending",
+                            {"evidence_id": cur.lastrowid, "flags": [f["code"] for f in flags]})
+            return {"evidence": dict(conn.execute("SELECT * FROM evidence WHERE id=?", (cur.lastrowid,)).fetchone()),
+                    "bulk_reuse": suspicious, "affected_claims": hash_claims,
+                    "verification": {"status": status, "flags": flags}}
+
+    def verify_evidence(self, actor: str, role: str, evidence_id: int, decision: str,
+                        reason: str = "") -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "核验现场证据")
+        if decision not in {"confirm", "reject"}:
+            raise DomainError("核验决定无效")
+        reason = (reason or "").strip()
+        if decision == "reject" and not reason:
+            raise DomainError("驳回必须写明原因")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            evidence = conn.execute("SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone()
+            if not evidence:
+                raise DomainError("证据不存在", 404)
+            if evidence["status"] != "pending":
+                raise DomainError("证据已核验锁定，不能重复处理", 409)
+            new_status = "verified" if decision == "confirm" else "rejected"
+            conn.execute(
+                "UPDATE evidence SET status=?,verified_by=?,verified_at=?,reject_reason=? WHERE id=?",
+                (new_status, actor, utcnow(), reason if decision == "reject" else None, evidence_id),
+            )
+            self._audit(conn, evidence["claim_id"], actor,
+                        "evidence.verification_confirmed" if decision == "confirm" else "evidence.verification_rejected",
+                        {"evidence_id": evidence_id, "reason": reason,
+                         "flags": json.loads(evidence["verify_flags"] or "[]")})
+            return dict(conn.execute("SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone())
+
+    def pending_verifications(self, actor: str, role: str) -> list[dict[str, Any]]:
+        require_role(role, {"supervisor", "auditor"}, "查看待核验清单")
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT e.*, c.claim_no, c.event_id FROM evidence e JOIN claims c ON c.id=e.claim_id
+                   WHERE e.status='pending' ORDER BY e.id"""
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def record_survey(self, actor: str, role: str, claim_id: int, damage_ratio: float,
                       findings: str, recommendation: str, expected_version: int) -> dict[str, Any]:
@@ -335,6 +446,8 @@ class CatastropheClaimService:
                 raise DomainError("案件已变化，请刷新后重试", 409)
             if not conn.execute("SELECT 1 FROM survey_notes WHERE claim_id=?", (claim_id,)).fetchone():
                 raise DomainError("缺少查勘记录", 409)
+            if conn.execute("SELECT 1 FROM evidence WHERE claim_id=? AND status='pending'", (claim_id,)).fetchone():
+                raise DomainError("存在待核验的现场证据，主管确认前不能提交核损", 409)
             conn.execute("UPDATE claims SET status='review',version=version+1,updated_at=? WHERE id=?", (utcnow(), claim_id))
             self._audit(conn, claim_id, actor, "claim.review_submitted", {})
             return dict(self._claim(conn, claim_id))
@@ -425,7 +538,7 @@ class CatastropheClaimService:
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         allowed = role in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}
         if not allowed:
-            return {"claims": [], "evidence": [], "payments": [], "timeline": [], "access_limited": True}
+            return {"claims": [], "evidence": [], "payments": [], "timeline": [], "zones": [], "access_limited": True}
         with self.connect() as conn:
             if role in {"adjuster", "surveyor"}:
                 claims = [dict(r) for r in conn.execute(
@@ -439,9 +552,10 @@ class CatastropheClaimService:
                 evidence = [dict(r) for r in conn.execute("SELECT * FROM evidence WHERE claim_id IN (%s) ORDER BY id DESC" % marks, ids).fetchall()]
                 payments = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE claim_id IN (%s) ORDER BY id DESC" % marks, ids).fetchall()]
                 timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline WHERE claim_id IN (%s) ORDER BY id DESC LIMIT 300" % marks, ids).fetchall()]
+                zones = [dict(r) for r in conn.execute("SELECT * FROM disaster_zones WHERE claim_id IN (%s)" % marks, ids).fetchall()]
             else:
-                evidence, payments, timeline = [], [], []
-        return {"claims": claims, "evidence": evidence, "payments": payments, "timeline": timeline, "access_limited": False}
+                evidence, payments, timeline, zones = [], [], [], []
+        return {"claims": claims, "evidence": evidence, "payments": payments, "timeline": timeline, "zones": zones, "access_limited": False}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -498,6 +612,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/queue":
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
+            elif path == "/api/verifications/pending":
+                actor, role = self._headers()
+                self._send(200, {"pending": self.service.pending_verifications(actor, role)})
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
@@ -510,10 +627,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.create_claim(actor, role, **data)
             elif path == "/api/claims/triage":
                 result = self.service.triage_claim(actor, role, **data)
+            elif path == "/api/claims/disaster-zone":
+                result = self.service.register_disaster_zone(actor, role, **data)
             elif path == "/api/claims/assign":
                 result = self.service.assign_claim(actor, role, **data)
             elif path == "/api/evidence":
                 result = self.service.add_evidence(actor, role, **data)
+            elif path == "/api/evidence/verify":
+                result = self.service.verify_evidence(actor, role, **data)
             elif path == "/api/claims/survey":
                 result = self.service.record_survey(actor, role, **data)
             elif path == "/api/claims/submit-review":
