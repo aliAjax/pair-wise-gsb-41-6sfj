@@ -1,6 +1,107 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}</style>
-<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
-<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度 · 证据核验</title>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1280px;margin:24px auto;padding:0 20px;color:#263746}
+h1{font-size:22px}h2{font-size:18px;margin-top:30px}
+table{border-collapse:collapse;width:100%;margin:12px 0}th,td{border:1px solid #d3dce3;padding:6px 8px;font-size:13px;vertical-align:top}
+th{background:#f1f5f7;text-align:left}
+.card{background:#fff8eb;border-left:5px solid #d58b21;padding:10px 16px;margin:12px 0}
+code{background:#eef2f4;padding:2px 5px}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-right:4px}
+.pending{background:#fdebd0;color:#9c5a08}.verified{background:#dff0d8;color:#2d6a1e}.rejected{background:#f8d7da;color:#842029}
+.locked{background:#e2e8f0;color:#445}
+.muted{color:#7a8893;font-size:12px}.reasons{color:#9c5a08}
+.toolbar{display:flex;gap:10px;align-items:center;margin:10px 0;flex-wrap:wrap}
+select,input{font:inherit;padding:4px 8px;border:1px solid #b9c4cc;border-radius:4px}
+.reviewbox{background:#fbfbfd;border:1px solid #e3e8ec;border-radius:6px;padding:10px 14px}
+</style>
+<h1>巨灾保险理赔调度 · 现场证据核验</h1>
+<div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>（intake / adjuster / surveyor / supervisor / auditor）。本页为只读看板。</div>
+<div class="toolbar">
+  <label>操作人 <input id="user" value="sup1" size="10"></label>
+  <label>角色
+    <select id="role">
+      <option value="supervisor" selected>supervisor 主管</option>
+      <option value="auditor">auditor 审计</option>
+      <option value="adjuster">adjuster 理算</option>
+      <option value="surveyor">surveyor 查勘员</option>
+      <option value="intake">intake 受理</option>
+    </select>
+  </label>
+  <button id="refresh">刷新</button>
+  <span id="meta" class="muted"></span>
+</div>
+
+<h2>案件核验状态</h2>
+<table id="claims"><thead><tr>
+  <th>报案号</th><th>灾情</th><th>区域</th><th>案件状态</th><th>优先级</th><th>负责人</th>
+  <th>证据核验（待核/通过/驳回）</th><th>锁定</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>主管待核验清单</h2>
+<div id="pendingList" class="reviewbox"><span class="muted">加载中…</span></div>
+
+<h2>已登记灾区</h2>
+<table id="zones"><thead><tr><th>灾情编号</th><th>灾区</th><th>中心</th><th>半径(公里)</th><th>灾情时刻(UTC)</th></tr></thead><tbody></tbody></table>
+
 <h2>最近时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<p class="muted">规则：证据落在灾区半径外、拍摄时间早于灾情时刻、或同一设备号 60 分钟内在相距 ≥100 公里现场出现，均先进入待核验；主管确认通过前案件不能提交核损，驳回须写明原因且原始证据保留。</p>
+
+<script>
+const STATUS_LABEL={pending:'待核验',verified:'已通过',rejected:'已驳回'};
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function load(){
+  const user=document.querySelector('#user').value||'viewer';
+  const role=document.querySelector('#role').value;
+  localStorage.setItem('cu',user);localStorage.setItem('cr',role);
+  const H={'X-User':user,'X-Role':role};
+  const [state,pending]=await Promise.all([
+    fetch('/api/state',{headers:H}).then(r=>r.json()),
+    fetch('/api/evidence/pending',{headers:H}).then(r=>r.json()).catch(()=>({pending:null}))
+  ]);
+  document.querySelector('#meta').textContent=state.access_limited?'当前角色无权查看数据':('更新于 '+new Date().toLocaleTimeString());
+  document.querySelector('#claims tbody').innerHTML=state.claims.map(c=>{
+    const s=c.evidence_summary||{pending:0,verified:0,rejected:0,total:0};
+    const badges=[];
+    if(s.pending)badges.push(`<span class="badge pending">待核验 ${s.pending}</span>`);
+    if(s.verified)badges.push(`<span class="badge verified">已通过 ${s.verified}</span>`);
+    if(s.rejected)badges.push(`<span class="badge rejected">已驳回 ${s.rejected}</span>`);
+    if(!s.total)badges.push('<span class="muted">无证据</span>');
+    const allLocked=s.pending===0;
+    return `<tr><td>${esc(c.claim_no)}</td><td>${esc(c.event_id)}</td><td>${esc(c.region)}</td>
+      <td>${esc(c.status)}</td><td>${(c.priority_score||0).toFixed(1)}</td><td>${esc(c.assignee||'')}</td>
+      <td>${badges.join(' ')}</td>
+      <td>${s.total?(allLocked?'<span class="badge locked">已锁定</span>':'<span class="badge pending">未锁定</span>'):'—'}</td></tr>`;
+  }).join('');
+  const pl=document.querySelector('#pendingList');
+  if(pending.pending===null){pl.innerHTML='<span class="muted">当前角色无权查看待核验清单（仅 supervisor / auditor）</span>';}
+  else if(!pending.pending.length){pl.innerHTML='<span class="muted">暂无待核验证据。</span>';}
+  else{
+    pl.innerHTML='<table><thead><tr><th>证据</th><th>报案号</th><th>设备号</th><th>拍摄时间(UTC)</th>
+      <th>拍摄位置</th><th>距灾区中心</th><th>命中规则</th></tr></thead><tbody>'+
+      pending.pending.map(e=>{
+        const reasons=[];
+        if(e.distance_km!=null&&e.radius_km!=null&&e.distance_km>e.radius_km)
+          reasons.push(`位置在灾区外：距中心 ${e.distance_km} 公里，半径 ${e.radius_km} 公里`);
+        if(e.disaster_time&&e.captured_at&&e.captured_at<e.disaster_time)
+          reasons.push(`拍摄早于灾情（灾情 ${esc(e.disaster_time)}）`);
+        return `<tr><td>#${e.id}<br><span class="muted">${esc(e.filename)}</span></td>
+          <td>${esc(e.claim_no)}<br><span class="muted">${esc(e.event_id)}</span></td>
+          <td>${esc(e.device_id||'')}</td><td>${esc(e.captured_at||'')}</td>
+          <td>${e.latitude==null?'—':(Number(e.latitude).toFixed(4)+', '+Number(e.longitude).toFixed(4))}</td>
+          <td>${e.distance_km==null?'<span class="muted">未登记灾区</span>':e.distance_km+' 公里'}</td>
+          <td class="reasons">${reasons.length?reasons.join('<br>'):'同设备短时间跨区（见时间线）'}</td></tr>`;
+      }).join('')+'</tbody></table>';
+  }
+  document.querySelector('#zones tbody').innerHTML=(state.zones||[]).map(z=>
+    `<tr><td>${esc(z.event_id)}</td><td>${esc(z.name)}</td>
+     <td>${Number(z.latitude).toFixed(4)}, ${Number(z.longitude).toFixed(4)}</td>
+     <td>${z.radius_km}</td><td>${esc(z.disaster_time)}</td></tr>`).join('')||
+    '<tr><td colspan="5" class="muted">尚未登记灾区</td></tr>';
+  document.querySelector('#timeline').innerHTML=(state.timeline||[]).slice(0,20).map(x=>
+    `<li><span class="muted">${esc(x.created_at)}</span> ${esc(x.actor)} <b>${esc(x.action)}</b> ${esc(x.details)}</li>`).join('');
+}
+document.querySelector('#user').value=localStorage.getItem('cu')||'sup1';
+document.querySelector('#role').value=localStorage.getItem('cr')||'supervisor';
+document.querySelector('#refresh').onclick=load;
+load();
+</script></html>
